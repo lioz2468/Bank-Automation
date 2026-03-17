@@ -36,7 +36,6 @@ from enum import IntEnum, auto
 from typing import List, Optional, Dict
 
 import pdfplumber
-from pdfminer.layout import LAParams
 
 from parsers.base import BaseParser
 from models.statement import Statement, TierRow
@@ -48,10 +47,11 @@ FW_X = 340.0   # framework column:              x >= FW_X
 T1_X = 260.0   # tier-1 / (tier-2 or excess) boundary
 T2_X = 165.0   # tier-2 / excess boundary (3-tier periods only)
 
-# ── Minimal LAParams — disables expensive layout analysis pdfminer does by
-#    default (column detection, text-flow ordering).  This alone can cut
-#    pdfminer's working-set by 30–50 % on multi-column PDFs. ──────────────────
-_LAPARAMS = LAParams(boxes_flow=None, detect_vertical=False)
+# ── Minimal laparams dict — pdfplumber.open() unpacks this as
+#    LAParams(**laparams) internally, so it must be a dict, not a LAParams
+#    instance.  boxes_flow=None disables column-flow analysis; detect_vertical
+#    =False skips vertical-text detection — both cut pdfminer's RAM usage. ────
+_LAPARAMS = {"boxes_flow": None, "detect_vertical": False}
 
 # ── Regex tokens ──────────────────────────────────────────────────────────────
 _DATE_RE    = re.compile(r"^(\d{2}/\d{2}/\d{2,4})$")
