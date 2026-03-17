@@ -47,12 +47,6 @@ FW_X = 340.0   # framework column:              x >= FW_X
 T1_X = 260.0   # tier-1 / (tier-2 or excess) boundary
 T2_X = 165.0   # tier-2 / excess boundary (3-tier periods only)
 
-# ── Minimal laparams dict — pdfplumber.open() unpacks this as
-#    LAParams(**laparams) internally, so it must be a dict, not a LAParams
-#    instance.  boxes_flow=None disables column-flow analysis; detect_vertical
-#    =False skips vertical-text detection — both cut pdfminer's RAM usage. ────
-_LAPARAMS = {"boxes_flow": None, "detect_vertical": False}
-
 # ── Regex tokens ──────────────────────────────────────────────────────────────
 _DATE_RE    = re.compile(r"^(\d{2}/\d{2}/\d{2,4})$")
 _RATE_RE    = re.compile(r"^(\d+\.\d+)%$")
@@ -119,24 +113,18 @@ class HapoalimParser(BaseParser):
 
     def parse(self, file_path: str) -> Statement:
         stmt = Statement()
-        self._init_sm(stmt)
-
-        # Process one page at a time so only one page's words are in memory at
-        # once.  State persists across pages via instance variables (_init_sm /
-        # _feed).  flush_cache() drops pdfplumber's per-page cached objects
-        # (layout tree, char list, etc.) immediately after we're done with each
-        # page.
-        with pdfplumber.open(file_path, laparams=_LAPARAMS) as pdf:
+        # Collect all lines from all pages before running the state machine.
+        # This preserves state across page boundaries (periods that span two pages).
+        # x_tolerance=1 keeps adjacent column numbers separate (gap can be <3 px).
+        all_lines: List[List[dict]] = []
+        with pdfplumber.open(file_path) as pdf:
             for page in pdf.pages:
                 words = page.extract_words(
                     x_tolerance=1, y_tolerance=3, keep_blank_chars=False
                 )
-                lines = _group_lines(words, y_tol=4.0)
-                del words           # release word-dict list before next page
-                self._feed(lines)
-                del lines
-                page.flush_cache()  # drop pdfplumber's page-level cache
+                all_lines.extend(_group_lines(words, y_tol=4.0))
 
+        self._process_lines(all_lines, stmt)
         self._calculate_totals(stmt)
         logger.info(
             "Parsed %d tier rows; total_tier1=%.2f excess=%.2f total_charged=%.2f",
@@ -144,52 +132,19 @@ class HapoalimParser(BaseParser):
         )
         return stmt
 
-    # ── State-machine initialisation ──────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _init_sm(self, stmt: Statement) -> None:
-        """Initialise all state-machine variables before processing page 1."""
-        self._stmt      = stmt
-        self._state     = _S.HEADER
-        self._pf        = ""
-        self._pt        = ""
-        self._fw1       = ""
-        self._fw2       = ""
-        self._tier_t1: Optional[float] = None
-        self._tier_t2: Optional[float] = None
-        self._rate_t1   = 0.0
-        self._rate_t2   = 0.0
-        self._rate_ex   = 0.0
-        self._debit_t1  = 0.0
-        self._debit_t2  = 0.0
-        self._debit_ex  = 0.0
-        self._has_t2    = False
+    def _process_lines(self, lines: List[List[dict]], stmt: Statement) -> None:
+        state = _S.HEADER
 
-    # ── Incremental page feed (state persists across calls) ───────────────────
-
-    def _feed(self, lines: List[List[dict]]) -> None:
-        """
-        Run the state machine over *lines* (one page's worth).
-        Instance variables carry state from the previous page so periods that
-        span a page boundary are handled correctly.
-        """
-        stmt = self._stmt
-
-        # Copy instance state to locals for the inner loop (faster attribute
-        # access and cleaner code); save back at the end.
-        state    = self._state
-        curr_pf  = self._pf
-        curr_pt  = self._pt
-        curr_fw1 = self._fw1
-        curr_fw2 = self._fw2
-        curr_tier_t1 = self._tier_t1
-        curr_tier_t2 = self._tier_t2
-        curr_rate_t1 = self._rate_t1
-        curr_rate_t2 = self._rate_t2
-        curr_rate_ex = self._rate_ex
-        curr_debit_t1 = self._debit_t1
-        curr_debit_t2 = self._debit_t2
-        curr_debit_ex = self._debit_ex
-        has_t2   = self._has_t2
+        # Per-period accumulators (reset at each new period)
+        curr_pf = curr_pt = ""
+        curr_fw1 = curr_fw2 = ""
+        curr_tier_t1: Optional[float] = None
+        curr_tier_t2: Optional[float] = None
+        curr_rate_t1 = curr_rate_t2 = curr_rate_ex = 0.0
+        curr_debit_t1 = curr_debit_t2 = curr_debit_ex = 0.0
+        has_t2 = False   # True if this period has a מדרגה 2 tier
 
         for line in lines:
             rw = _readable(line)
@@ -373,22 +328,6 @@ class HapoalimParser(BaseParser):
                 if not stmt.charge_date:
                     stmt.charge_date = dates[0]["text"]
                 continue
-
-        # ── Save state back to instance for the next page ─────────────────────
-        self._state    = state
-        self._pf       = curr_pf
-        self._pt       = curr_pt
-        self._fw1      = curr_fw1
-        self._fw2      = curr_fw2
-        self._tier_t1  = curr_tier_t1
-        self._tier_t2  = curr_tier_t2
-        self._rate_t1  = curr_rate_t1
-        self._rate_t2  = curr_rate_t2
-        self._rate_ex  = curr_rate_ex
-        self._debit_t1 = curr_debit_t1
-        self._debit_t2 = curr_debit_t2
-        self._debit_ex = curr_debit_ex
-        self._has_t2   = has_t2
 
     # ─────────────────────────────────────────────────────────────────────────
 
