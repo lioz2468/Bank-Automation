@@ -7,6 +7,7 @@ The frontend (Next.js on Vercel) calls POST /process.
 
 from __future__ import annotations
 
+import gc
 import io
 import logging
 import os
@@ -89,6 +90,11 @@ async def process(
             stmt.company_city = "תל אביב - יפו"
         if not stmt.company_id:
             stmt.company_id = "6492102"
+
+        # Release pdfminer/pdfplumber memory before the next heavy step.
+        # CPython's cycle collector won't necessarily run between the parse
+        # and the BOI HTTP call, so trigger it explicitly here.
+        gc.collect()
 
         # ── Validate period dates ──────────────────────────────────────────
         if not stmt.period_from or not stmt.period_to:
