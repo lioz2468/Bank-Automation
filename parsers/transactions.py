@@ -24,6 +24,9 @@ import re
 from datetime import datetime as _datetime, date as _date
 from typing import Dict, List, Optional
 
+# Matches "תאריך ערך: DD/MM" or "תאריך ערך: DD/MM/YY" inside operation text
+_VALUE_DATE_RE = re.compile(r'תאריך ערך[:\s]+(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?')
+
 import openpyxl
 
 from models.statement import BankTransaction
@@ -125,6 +128,57 @@ def _normalise_date(raw: str) -> str:
     return f"{int(d):02d}.{int(mo):02d}.{y}"
 
 
+def _extract_value_date(operation: str, period_from: str = "", period_to: str = "") -> Optional[_date]:
+    """
+    Extract a value date from Hebrew operation text, e.g. 'רבית (תאריך ערך: 03/10)'.
+    Year is taken from the text when present (DD/MM/YY); otherwise inferred from
+    period_from / period_to.  Returns None if no match or year cannot be resolved.
+    """
+    m = _VALUE_DATE_RE.search(operation)
+    if not m:
+        return None
+    day, month = int(m.group(1)), int(m.group(2))
+    year_str = m.group(3)
+    if year_str:
+        year = int(year_str)
+        if year < 100:
+            year = (2000 + year) if year < 70 else (1900 + year)
+        try:
+            return _date(year, month, day)
+        except ValueError:
+            return None
+    # No year in text — infer from period bounds
+    from_dt = to_dt = None
+    for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+        try:
+            from_dt = _datetime.strptime(period_from, fmt).date()
+            break
+        except ValueError:
+            pass
+    for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+        try:
+            to_dt = _datetime.strptime(period_to, fmt).date()
+            break
+        except ValueError:
+            pass
+    if from_dt is None:
+        return None
+    years = sorted({from_dt.year} | ({to_dt.year} if to_dt else set()))
+    for year in years:
+        try:
+            candidate = _date(year, month, day)
+            lo, hi = from_dt, to_dt or from_dt
+            if lo <= candidate <= hi:
+                return candidate
+        except ValueError:
+            pass
+    # Fallback: use from_dt year even if outside range
+    try:
+        return _date(from_dt.year, month, day)
+    except ValueError:
+        return None
+
+
 def _map_headers(raw_headers: list) -> Dict[int, str]:
     """Return {column_index: field_name} for every recognised header."""
     mapping: Dict[int, str] = {}
@@ -136,7 +190,12 @@ def _map_headers(raw_headers: list) -> Dict[int, str]:
     return mapping
 
 
-def _row_to_tx(row: list, mapping: Dict[int, str]) -> Optional[BankTransaction]:
+def _row_to_tx(
+    row: list,
+    mapping: Dict[int, str],
+    period_from: str = "",
+    period_to: str = "",
+) -> Optional[BankTransaction]:
     """Convert one data row to a BankTransaction, or None if the row is empty/invalid."""
     fields: Dict[str, object] = {
         "date": "", "code": "", "operation": "", "details": "",
@@ -155,7 +214,11 @@ def _row_to_tx(row: list, mapping: Dict[int, str]) -> Optional[BankTransaction]:
         return None   # skip header-repetition or totals rows
 
     fields["date"] = _normalise_date(date_str)
-    return BankTransaction(**fields)  # type: ignore[arg-type]
+    tx = BankTransaction(**fields)  # type: ignore[arg-type]
+    tx.value_date = _extract_value_date(
+        str(fields.get("operation", "")), period_from, period_to
+    )
+    return tx
 
 
 def _find_header_row(rows: list) -> tuple[Optional[int], Dict[int, str]]:
@@ -172,7 +235,11 @@ def _find_header_row(rows: list) -> tuple[Optional[int], Dict[int, str]]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def parse_transactions(file_path: str) -> List[BankTransaction]:
+def parse_transactions(
+    file_path: str,
+    period_from: str = "",
+    period_to: str = "",
+) -> List[BankTransaction]:
     """
     Parse a Bank Hapoalim transaction export file (Excel or CSV).
 
@@ -180,13 +247,16 @@ def parse_transactions(file_path: str) -> List[BankTransaction]:
     the file (typically newest-first, matching the bank's default sort).
     Unknown columns are silently ignored; missing optional columns default
     to empty string / None.
+
+    period_from / period_to (DD/MM/YY format) are used to infer the year
+    for value dates that appear as DD/MM without a year in the operation text.
     """
     if file_path.lower().endswith(".csv"):
-        return _parse_csv(file_path)
-    return _parse_excel(file_path)
+        return _parse_csv(file_path, period_from, period_to)
+    return _parse_excel(file_path, period_from, period_to)
 
 
-def _parse_excel(file_path: str) -> List[BankTransaction]:
+def _parse_excel(file_path: str, period_from: str = "", period_to: str = "") -> List[BankTransaction]:
     wb = openpyxl.load_workbook(file_path, data_only=True)
     ws = wb.active
     rows = [list(row) for row in ws.iter_rows(values_only=True)]
@@ -197,13 +267,13 @@ def _parse_excel(file_path: str) -> List[BankTransaction]:
 
     txs: List[BankTransaction] = []
     for row in rows[header_idx + 1:]:
-        tx = _row_to_tx(row, mapping)
+        tx = _row_to_tx(row, mapping, period_from, period_to)
         if tx:
             txs.append(tx)
     return txs
 
 
-def _parse_csv(file_path: str) -> List[BankTransaction]:
+def _parse_csv(file_path: str, period_from: str = "", period_to: str = "") -> List[BankTransaction]:
     # Try UTF-8-with-BOM first (common for Israeli bank exports), then Windows-1255
     for encoding in ("utf-8-sig", "windows-1255", "utf-8"):
         try:
@@ -221,7 +291,7 @@ def _parse_csv(file_path: str) -> List[BankTransaction]:
 
     txs: List[BankTransaction] = []
     for row in rows[header_idx + 1:]:
-        tx = _row_to_tx(row, mapping)
+        tx = _row_to_tx(row, mapping, period_from, period_to)
         if tx:
             txs.append(tx)
     return txs
