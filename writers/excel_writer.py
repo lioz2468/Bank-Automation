@@ -565,16 +565,23 @@ class ExcelWriter:
         ws.sheet_view.rightToLeft = True
         stmt = self.stmt
 
+        # Column layout (A–N):
+        #   A=date  B=code  C=operation  D=details  E=reference  F=batch
+        #   G=debit  H=credit  I=balance
+        #   J=adjustment (only rows affected by value_date transactions)
+        #   K=adjusted balance = I+J  (only when J is set)
+        #   L=days  M=P1 interest  N=P2 interest
+        #   O/P = summary
+
         # ── Row 3: Title + column labels + effective rates ────────────────
-        # M3 = P1 effective rate, N3 = P2 effective rate (if rate changed mid-period).
-        # B3 and K3 serve as lightweight column headers for the two new columns.
+        # M3 = P1 effective rate, N3 = P2 effective rate
         p1_eff = stmt.bank_rate_p1 + stmt.debit_margin
         p2_eff = (stmt.bank_rate_p2 + stmt.debit_margin
                   if stmt.bank_rate_p2 is not None else None)
 
         _set(ws, "A3", "תנועות בחשבון", bold=True, alignment=_rtl_align())
-        _set(ws, "B3", "תאריך ערך", bold=True, alignment=_center_rtl())
-        _set(ws, "K3", "יתרה מתואמת", bold=True, alignment=_center_rtl())
+        _set(ws, "J3", "תיאום",         bold=True, alignment=_center_rtl())
+        _set(ws, "K3", "יתרה מתואמת",  bold=True, alignment=_center_rtl())
         _set(ws, "M3", p1_eff, number_format="0.00%", alignment=_center_rtl())
         if p2_eff is not None:
             _set(ws, "N3", p2_eff, number_format="0.00%", alignment=_center_rtl())
@@ -584,7 +591,7 @@ class ExcelWriter:
         if stmt.rate_change_date is not None:
             rcd = _parse_rate_change_day(stmt.rate_change_date)
 
-        # ── Filter transactions: one per calendar date, within period ─────
+        # ── Parse period_to boundary ──────────────────────────────────────
         period_to_dt = None
         for _fmt in ("%d/%m/%y", "%d/%m/%Y", "%d.%m.%y", "%d.%m.%Y"):
             try:
@@ -593,118 +600,105 @@ class ExcelWriter:
             except ValueError:
                 pass
 
-        seen_dates: set = set()
-        filtered_tx = []
+        # ── All transactions within period (NO one-per-day dedup) ─────────
+        filtered_tx: List[BankTransaction] = []
         for tx in stmt.transactions:
             dt = _parse_tx_date(tx.date)
             if dt is None:
                 continue
-            d = dt.date()
-            if period_to_dt is not None and d > period_to_dt:
+            if period_to_dt is not None and dt.date() > period_to_dt:
                 continue
-            if d in seen_dates:
-                continue
-            seen_dates.add(d)
             filtered_tx.append(tx)
 
-        # ── Re-sort by effective date (value_date if present, else op date) ─
-        def _eff_date(tx: BankTransaction) -> date:
-            if tx.value_date is not None:
-                return tx.value_date
-            dt = _parse_tx_date(tx.date)
-            return dt.date() if dt is not None else date.min
-
-        filtered_tx.sort(key=_eff_date, reverse=True)   # newest effective first
-
-        # ── Precompute effective dates list ───────────────────────────────
-        eff_dates = [_eff_date(tx) for tx in filtered_tx]
-
-        # ── Compute adjusted balances (anchor = newest row, propagate back) ─
-        # Going newest→oldest: adj[i] = adj[i-1] - debit[i] + credit[i]
-        # Rationale: a debit at effective date T means the account was deeper
-        # in debt from T onward; moving it earlier makes that row more negative.
-        adj_balances: List[Optional[float]] = []
-        for i, tx in enumerate(filtered_tx):
-            if i == 0:
-                adj_balances.append(tx.balance)
+        # ── Precompute per-row adjustment from value_date transactions ─────
+        # For each transaction tx_vd that carries a value_date:
+        #   adjustment = abs(tx_vd.balance)   (the total overdraft at that row)
+        #   Apply to every row whose op_date is in [value_date, tx_vd.op_date]
+        vd_entries: List[Tuple[date, date, float]] = []   # (vd_start, vd_end, amount)
+        for tx_vd in stmt.transactions:
+            if tx_vd.value_date is None:
+                continue
+            op_dt = _parse_tx_date(tx_vd.date)
+            if op_dt is None:
+                continue
+            if tx_vd.balance is not None and tx_vd.balance != 0:
+                amount = abs(tx_vd.balance)
+            elif tx_vd.debit is not None:
+                amount = abs(tx_vd.debit)
             else:
-                prev = adj_balances[i - 1]
-                if prev is None:
-                    adj_balances.append(tx.balance)
-                else:
-                    adj_balances.append(prev - (tx.debit or 0.0) + (tx.credit or 0.0))
+                continue
+            vd_entries.append((tx_vd.value_date, op_dt.date(), amount))
+
+        def _row_adjustment(row_date: date) -> Optional[float]:
+            total = sum(amt for (vd_start, vd_end, amt) in vd_entries
+                        if vd_start <= row_date <= vd_end)
+            return total if total > 0 else None
 
         DATA_START = 4
         num_fmt_money = "#,##0.00"
 
-        # L for first row: days from first effective date to charge date
-        charge_dt   = _parse_tx_date(stmt.charge_date)
-        first_eff   = eff_dates[0] if eff_dates else None
-        if charge_dt is not None and first_eff is not None and first_eff != date.min:
-            first_j = max(1, (charge_dt.date() - first_eff).days)
+        # L for first row: days from first tx date to charge date
+        charge_dt = _parse_tx_date(stmt.charge_date)
+        first_dt  = _parse_tx_date(filtered_tx[0].date) if filtered_tx else None
+        if charge_dt is not None and first_dt is not None:
+            first_j = max(1, (charge_dt - first_dt).days)
         else:
             first_j = 1
 
         for i, tx in enumerate(filtered_tx):
-            n       = DATA_START + i
-            dt      = _parse_tx_date(tx.date)
-            adj_bal = adj_balances[i]
-            eff_dt  = eff_dates[i]
+            n      = DATA_START + i
+            dt     = _parse_tx_date(tx.date)
+            tx_dt  = dt.date() if dt is not None else None
 
             # A: operation date
             _set(ws, f"A{n}", dt if dt is not None else tx.date,
                  number_format="DD.MM.YYYY", alignment=_center_rtl())
-
-            # B: value_date (new column) — empty when none
-            if tx.value_date is not None:
-                vd_as_dt = datetime(tx.value_date.year, tx.value_date.month, tx.value_date.day)
-                _set(ws, f"B{n}", vd_as_dt, number_format="DD.MM.YYYY", alignment=_center_rtl())
-
-            # C–G: shifted one column right vs. old layout
-            _set(ws, f"C{n}", tx.code,      alignment=_center_rtl())
-            _set(ws, f"D{n}", tx.operation, alignment=_rtl_align())
-            _set(ws, f"E{n}", tx.details,   alignment=_rtl_align())
-            _set(ws, f"F{n}", tx.reference, alignment=_center_rtl())
-            _set(ws, f"G{n}", tx.batch,     alignment=_center_rtl())
-
-            # H–J: debit, credit, original balance
+            # B: operation code
+            _set(ws, f"B{n}", tx.code, alignment=_center_rtl())
+            # C–F: text fields
+            _set(ws, f"C{n}", tx.operation, alignment=_rtl_align())
+            _set(ws, f"D{n}", tx.details,   alignment=_rtl_align())
+            _set(ws, f"E{n}", tx.reference, alignment=_center_rtl())
+            _set(ws, f"F{n}", tx.batch,     alignment=_center_rtl())
+            # G: debit, H: credit, I: balance
             if tx.debit is not None:
-                _set(ws, f"H{n}", tx.debit,   number_format=num_fmt_money, alignment=_right_rtl())
+                _set(ws, f"G{n}", tx.debit,   number_format=num_fmt_money, alignment=_right_rtl())
             if tx.credit is not None:
-                _set(ws, f"I{n}", tx.credit,  number_format=num_fmt_money, alignment=_right_rtl())
+                _set(ws, f"H{n}", tx.credit,  number_format=num_fmt_money, alignment=_right_rtl())
             if tx.balance is not None:
-                _set(ws, f"J{n}", tx.balance, number_format=num_fmt_money, alignment=_right_rtl())
+                _set(ws, f"I{n}", tx.balance, number_format=num_fmt_money, alignment=_right_rtl())
 
-            # K: adjusted balance (new column)
-            if adj_bal is not None:
-                _set(ws, f"K{n}", adj_bal, number_format=num_fmt_money, alignment=_right_rtl())
+            # J: adjustment, K: adjusted balance (only when value_date affects this row)
+            adj = _row_adjustment(tx_dt) if tx_dt is not None else None
+            if adj is not None and tx.balance is not None:
+                _set(ws, f"J{n}", adj,
+                     number_format=num_fmt_money, alignment=_right_rtl())
+                _set(ws, f"K{n}", tx.balance + adj,
+                     number_format=num_fmt_money, alignment=_right_rtl())
 
-            # L: days held, computed from effective dates.
-            # Row 0: hardcoded int (charge_date − first effective date).
-            # Row i>0: IF formula using B (value_date) when present, else A (op date).
+            # L: days.  Row 0 = hardcoded int; all others = A{prev}-A{n}.
+            # Same-date rows naturally get 0 (A{prev}=A{n}), no special casing needed.
             if i == 0:
                 ws[f"L{n}"].value = first_j
             else:
-                prev_n = n - 1
-                ws[f"L{n}"].value = (
-                    f'=IF(B{prev_n}<>"",B{prev_n},A{prev_n})'
-                    f'-IF(B{n}<>"",B{n},A{n})'
-                )
+                ws[f"L{n}"].value = f"=A{n-1}-A{n}"
             ws[f"L{n}"].number_format = "0"
             ws[f"L{n}"].alignment     = _center_rtl()
 
-            # M / N: interest formula using adjusted balance (K) and effective days (L).
-            # P2 logic uses the effective date (not just op date).
-            use_p2 = (p2_eff is not None and rcd is not None
-                      and eff_dt != date.min and eff_dt >= rcd)
-            if use_p2:
-                ws[f"N{n}"].value         = f"=K{n}/365*L{n}*$N$3"
-                ws[f"N{n}"].number_format = num_fmt_money
-                ws[f"N{n}"].alignment     = _right_rtl()
-            else:
-                ws[f"M{n}"].value         = f"=K{n}/365*L{n}*$M$3"
-                ws[f"M{n}"].number_format = num_fmt_money
-                ws[f"M{n}"].alignment     = _right_rtl()
+            # M / N: interest formula.
+            # Conditions: L > 0 (first row of its date) AND effective balance < 0.
+            # Uses K (adjusted balance) when set, otherwise I (original balance).
+            # P1 (M) for rows before rate-change date; P2 (N) for rows on/after.
+            bal_ref = f"K{n}" if (adj is not None and tx.balance is not None) else f"I{n}"
+            use_p2  = (p2_eff is not None and rcd is not None
+                       and tx_dt is not None and tx_dt >= rcd)
+            interest_col  = "N" if use_p2 else "M"
+            rate_cell     = "$N$3"  if use_p2 else "$M$3"
+            ws[f"{interest_col}{n}"].value = (
+                f'=IF(AND(L{n}>0,{bal_ref}<0),{bal_ref}/365*L{n}*{rate_cell},"")'
+            )
+            ws[f"{interest_col}{n}"].number_format = num_fmt_money
+            ws[f"{interest_col}{n}"].alignment     = _right_rtl()
 
         # ── Summary rows ───────────────────────────────────────────────────
         last_row    = DATA_START + len(filtered_tx) - 1 if filtered_tx else DATA_START - 1
@@ -739,9 +733,9 @@ class ExcelWriter:
 
         # ── Column widths ─────────────────────────────────────────────────
         col_widths = {
-            "A": 14, "B": 14, "C": 12, "D": 22, "E": 18,
-            "F": 14, "G": 8,  "H": 18, "I": 18, "J": 18,
-            "K": 18, "L": 12, "M": 12, "N": 12, "O": 16, "P": 18,
+            "A": 14, "B": 10, "C": 22, "D": 18, "E": 14,
+            "F": 8,  "G": 18, "H": 18, "I": 18, "J": 16,
+            "K": 18, "L": 8,  "M": 14, "N": 14, "O": 16, "P": 18,
         }
         for col, width in col_widths.items():
             ws.column_dimensions[col].width = width

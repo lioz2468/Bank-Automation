@@ -174,7 +174,7 @@ def main() -> int:
     if tx_path:
         logger.info("Parsing transactions: %s", tx_path)
         try:
-            all_tx = parse_transactions(tx_path)
+            all_tx = parse_transactions(tx_path, stmt.period_from, stmt.period_to)
         except Exception as exc:
             logger.error("Failed to parse transactions file: %s", exc, exc_info=True)
             return 1
