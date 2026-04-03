@@ -611,9 +611,10 @@ class ExcelWriter:
             filtered_tx.append(tx)
 
         # ── Precompute per-row adjustment from value_date transactions ─────
-        # For each transaction tx_vd that carries a value_date:
-        #   adjustment = abs(tx_vd.balance)   (the total overdraft at that row)
-        #   Apply to every row whose op_date is in [value_date, tx_vd.op_date]
+        # Only interest-charge (ריבית) transactions that are debits produce
+        # an adjustment: the bank charged interest retroactively, so we add back
+        # the charge to recover the "true" balance for our recalculation.
+        # Non-interest value_date transactions (transfers, FX, refunds) are excluded.
         vd_entries: List[Tuple[date, date, float]] = []   # (vd_start, vd_end, amount)
         for tx_vd in stmt.transactions:
             if tx_vd.value_date is None:
@@ -621,6 +622,27 @@ class ExcelWriter:
             op_dt = _parse_tx_date(tx_vd.date)
             if op_dt is None:
                 continue
+            # Only pure interest charges: operation must contain ריבית,
+            # and the transaction must be a debit (negative balance or positive debit)
+            op_text = tx_vd.operation or ""
+            RIBBIT = chr(0x05E8)+chr(0x05D1)+chr(0x05D9)+chr(0x05EA)   # ריבית
+            if RIBBIT not in op_text:
+                continue
+            is_debit = (
+                (tx_vd.balance is not None and tx_vd.balance < 0) or
+                (tx_vd.debit is not None and tx_vd.debit > 0)
+            )
+            if not is_debit:
+                continue
+            # The ריבית charge must correspond to the interest charge from the PDF
+            # (stmt.total_charged). A different-period charge on the same account
+            # would have a very different amount and should not be adjusted.
+            debit_amount = (tx_vd.debit if tx_vd.debit is not None
+                            else abs(tx_vd.balance) if tx_vd.balance is not None else 0)
+            if stmt.total_charged > 0:
+                ratio = abs(debit_amount - stmt.total_charged) / stmt.total_charged
+                if ratio > 0.01:   # more than 1% off → different charge, skip
+                    continue
             if tx_vd.balance is not None and tx_vd.balance != 0:
                 amount = abs(tx_vd.balance)
             elif tx_vd.debit is not None:
