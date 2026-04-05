@@ -15,7 +15,7 @@ written in Excel A1 notation exactly as they appear in the sample file.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
 import openpyxl
@@ -187,7 +187,6 @@ def _period_needs_p2(period_from: str, rate_change_date: str) -> bool:
     if rcd is None or pfd is None:
         return False
     # Include the day before rate change (boundary row)
-    from datetime import timedelta
     return pfd >= (rcd - timedelta(days=1))
 
 
@@ -591,11 +590,19 @@ class ExcelWriter:
         if stmt.rate_change_date is not None:
             rcd = _parse_rate_change_day(stmt.rate_change_date)
 
-        # ── Parse period_to boundary ──────────────────────────────────────
+        # ── Parse period boundaries ───────────────────────────────────────
         period_to_dt = None
         for _fmt in ("%d/%m/%y", "%d/%m/%Y", "%d.%m.%y", "%d.%m.%Y"):
             try:
                 period_to_dt = datetime.strptime(stmt.period_to, _fmt).date()
+                break
+            except ValueError:
+                pass
+
+        period_from_dt = None
+        for _fmt in ("%d/%m/%y", "%d/%m/%Y", "%d.%m.%y", "%d.%m.%Y"):
+            try:
+                period_from_dt = datetime.strptime(stmt.period_from, _fmt).date()
                 break
             except ValueError:
                 pass
@@ -611,45 +618,69 @@ class ExcelWriter:
             filtered_tx.append(tx)
 
         # ── Precompute per-row adjustment from value_date transactions ─────
-        # Only interest-charge (ריבית) transactions that are debits produce
-        # an adjustment: the bank charged interest retroactively, so we add back
-        # the charge to recover the "true" balance for our recalculation.
-        # Non-interest value_date transactions (transfers, FX, refunds) are excluded.
-        vd_entries: List[Tuple[date, date, float]] = []   # (vd_start, vd_end, amount)
+        # Two types of adjustments:
+        #
+        # 1. ריבית (interest charge) backdated: the bank charged interest with an
+        #    earlier value_date, so the charge appears in the balance between
+        #    value_date and op_date.  We add it back for those rows.
+        #    (applies to rows where value_date <= row_date <= op_date)
+        #
+        # 2. Non-ריבית backdated debit: a large debit (e.g. transfer) whose
+        #    value_date is later than its operation date.  The balance column
+        #    already reflects this debit from the start of the period, but for
+        #    interest purposes it only counts from value_date onward.  We add
+        #    back the debit for all rows before value_date.
+        #    (applies to rows where period_from <= row_date < value_date)
+        vd_entries: List[Tuple[date, date, float]] = []   # (apply_from, apply_to, amount)
         for tx_vd in stmt.transactions:
             if tx_vd.value_date is None:
                 continue
             op_dt = _parse_tx_date(tx_vd.date)
             if op_dt is None:
                 continue
-            # Only pure interest charges: operation must contain ריבית,
-            # and the transaction must be a debit (negative balance or positive debit)
             op_text = tx_vd.operation or ""
             RIBBIT = chr(0x05E8)+chr(0x05D1)+chr(0x05D9)+chr(0x05EA)   # ריבית
-            if RIBBIT not in op_text:
-                continue
-            is_debit = (
-                (tx_vd.balance is not None and tx_vd.balance < 0) or
-                (tx_vd.debit is not None and tx_vd.debit > 0)
-            )
-            if not is_debit:
-                continue
-            # The ריבית charge must correspond to the interest charge from the PDF
-            # (stmt.total_charged). A different-period charge on the same account
-            # would have a very different amount and should not be adjusted.
-            debit_amount = (tx_vd.debit if tx_vd.debit is not None
-                            else abs(tx_vd.balance) if tx_vd.balance is not None else 0)
-            if stmt.total_charged > 0:
-                ratio = abs(debit_amount - stmt.total_charged) / stmt.total_charged
-                if ratio > 0.01:   # more than 1% off → different charge, skip
+
+            if RIBBIT in op_text:
+                # ── Type 1: ריבית adjustment (value_date → op_date) ──────
+                is_debit = (
+                    (tx_vd.balance is not None and tx_vd.balance < 0) or
+                    (tx_vd.debit is not None and tx_vd.debit > 0)
+                )
+                if not is_debit:
                     continue
-            if tx_vd.balance is not None and tx_vd.balance != 0:
-                amount = abs(tx_vd.balance)
-            elif tx_vd.debit is not None:
-                amount = abs(tx_vd.debit)
+                # Must match the PDF total_charged within 1 %
+                debit_amount = (tx_vd.debit if tx_vd.debit is not None
+                                else abs(tx_vd.balance) if tx_vd.balance is not None else 0)
+                if stmt.total_charged > 0:
+                    ratio = abs(debit_amount - stmt.total_charged) / stmt.total_charged
+                    if ratio > 0.01:
+                        continue
+                if tx_vd.balance is not None and tx_vd.balance != 0:
+                    amount = abs(tx_vd.balance)
+                elif tx_vd.debit is not None:
+                    amount = abs(tx_vd.debit)
+                else:
+                    continue
+                vd_entries.append((tx_vd.value_date, op_dt.date(), amount))
             else:
-                continue
-            vd_entries.append((tx_vd.value_date, op_dt.date(), amount))
+                # ── Type 2: backdated debit (period_from → value_date-1) ─
+                # Matches the outgoing leg of internal transfers where the bank
+                # assigned an earlier value_date.  These entries have no resulting
+                # balance (balance is None) because the bank shows them as pure
+                # outgoing legs without a post-transfer balance.
+                if tx_vd.debit is None or tx_vd.debit <= 0:
+                    continue
+                if tx_vd.balance is not None:
+                    continue  # has a post-tx balance → not a simple backdated transfer leg
+                if op_dt.date() <= tx_vd.value_date:
+                    continue  # not backdated; op_date must be after value_date
+                if period_from_dt is None:
+                    continue
+                apply_to = tx_vd.value_date - timedelta(days=1)
+                if apply_to < period_from_dt:
+                    continue  # range collapses; nothing to adjust
+                vd_entries.append((period_from_dt, apply_to, tx_vd.debit))
 
         def _row_adjustment(row_date: date) -> Optional[float]:
             total = sum(amt for (vd_start, vd_end, amt) in vd_entries
@@ -695,7 +726,7 @@ class ExcelWriter:
             if adj is not None and tx.balance is not None:
                 _set(ws, f"J{n}", adj,
                      number_format=num_fmt_money, alignment=_right_rtl())
-                _set(ws, f"K{n}", tx.balance + adj,
+                _set(ws, f"K{n}", f"=J{n}+I{n}",
                      number_format=num_fmt_money, alignment=_right_rtl())
 
             # L: days.  Row 0 = hardcoded int; all others = A{prev}-A{n}.
@@ -711,19 +742,95 @@ class ExcelWriter:
             # Conditions: L > 0 (first row of its date) AND effective balance < 0.
             # Uses K (adjusted balance) when set, otherwise I (original balance).
             # P1 (M) for rows before rate-change date; P2 (N) for rows on/after.
+            # Special case: when the row's date span straddles the rate-change date,
+            # write both M (P1 days) and N (P2 days) in the same row.
             bal_ref = f"K{n}" if (adj is not None and tx.balance is not None) else f"I{n}"
-            use_p2  = (p2_eff is not None and rcd is not None
-                       and tx_dt is not None and tx_dt >= rcd)
-            interest_col  = "N" if use_p2 else "M"
-            rate_cell     = "$N$3"  if use_p2 else "$M$3"
-            ws[f"{interest_col}{n}"].value = (
-                f'=IF(AND(L{n}>0,{bal_ref}<0),{bal_ref}/365*L{n}*{rate_cell},"")'
+
+            # Determine the previous row's date for split-boundary detection
+            if i == 0:
+                _prev_date_obj = (charge_dt.date()
+                                  if charge_dt is not None else None)
+            else:
+                _prev_dt_tmp = _parse_tx_date(filtered_tx[i - 1].date)
+                _prev_date_obj = (_prev_dt_tmp.date()
+                                  if _prev_dt_tmp is not None else None)
+
+            crosses_rcd = (
+                p2_eff is not None and rcd is not None
+                and tx_dt is not None and _prev_date_obj is not None
+                and tx_dt < rcd <= _prev_date_obj
             )
-            ws[f"{interest_col}{n}"].number_format = num_fmt_money
-            ws[f"{interest_col}{n}"].alignment     = _right_rtl()
+
+            if crosses_rcd:
+                # Split L into P1 days (before rcd) and P2 days (from rcd onward)
+                p1_days = (rcd - tx_dt).days
+                ws[f"M{n}"].value = (
+                    f'=IF(AND({p1_days}>0,{bal_ref}<0),'
+                    f'{bal_ref}/365*{p1_days}*$M$3,"")'
+                )
+                ws[f"M{n}"].number_format = num_fmt_money
+                ws[f"M{n}"].alignment     = _right_rtl()
+                ws[f"N{n}"].value = (
+                    f'=IF(AND(L{n}-{p1_days}>0,{bal_ref}<0),'
+                    f'{bal_ref}/365*(L{n}-{p1_days})*$N$3,"")'
+                )
+                ws[f"N{n}"].number_format = num_fmt_money
+                ws[f"N{n}"].alignment     = _right_rtl()
+            else:
+                use_p2        = (p2_eff is not None and rcd is not None
+                                 and tx_dt is not None and tx_dt >= rcd)
+                interest_col  = "N" if use_p2 else "M"
+                rate_cell     = "$N$3"  if use_p2 else "$M$3"
+                ws[f"{interest_col}{n}"].value = (
+                    f'=IF(AND(L{n}>0,{bal_ref}<0),{bal_ref}/365*L{n}*{rate_cell},"")'
+                )
+                ws[f"{interest_col}{n}"].number_format = num_fmt_money
+                ws[f"{interest_col}{n}"].alignment     = _right_rtl()
+
+        # ── Opening balance row ────────────────────────────────────────────
+        # When the billing period starts before the first transaction, the bank
+        # still charges interest for those days using the pre-period balance.
+        # Add a synthetic row at period_from_dt using the balance that was in
+        # the account just before the first transaction.
+        opening_row_added = False
+        if (filtered_tx and period_from_dt is not None):
+            oldest_tx = filtered_tx[-1]
+            oldest_dt = _parse_tx_date(oldest_tx.date)
+            oldest_date = oldest_dt.date() if oldest_dt is not None else None
+            if oldest_date is not None and oldest_date > period_from_dt:
+                # Compute balance just before the first (oldest) transaction.
+                # balance_before = balance_after - credit + debit
+                bal_before = (
+                    (oldest_tx.balance or 0)
+                    - (oldest_tx.credit or 0)
+                    + (oldest_tx.debit  or 0)
+                )
+                n_open = DATA_START + len(filtered_tx)
+                period_from_datetime = datetime(
+                    period_from_dt.year, period_from_dt.month, period_from_dt.day
+                )
+                _set(ws, f"A{n_open}", period_from_datetime,
+                     number_format="DD.MM.YYYY", alignment=_center_rtl())
+                _set(ws, f"I{n_open}", bal_before,
+                     number_format=num_fmt_money, alignment=_right_rtl())
+                ws[f"L{n_open}"].value        = f"=A{n_open-1}-A{n_open}"
+                ws[f"L{n_open}"].number_format = "0"
+                ws[f"L{n_open}"].alignment     = _center_rtl()
+                use_p2_open = (p2_eff is not None and rcd is not None
+                               and period_from_dt >= rcd)
+                rate_cell_open  = "$N$3" if use_p2_open else "$M$3"
+                int_col_open    = "N"    if use_p2_open else "M"
+                ws[f"{int_col_open}{n_open}"].value = (
+                    f'=IF(AND(L{n_open}>0,I{n_open}<0),'
+                    f'I{n_open}/365*L{n_open}*{rate_cell_open},"")'
+                )
+                ws[f"{int_col_open}{n_open}"].number_format = num_fmt_money
+                ws[f"{int_col_open}{n_open}"].alignment     = _right_rtl()
+                opening_row_added = True
 
         # ── Summary rows ───────────────────────────────────────────────────
-        last_row    = DATA_START + len(filtered_tx) - 1 if filtered_tx else DATA_START - 1
+        base_last = DATA_START + len(filtered_tx) - 1 if filtered_tx else DATA_START - 1
+        last_row  = base_last + (1 if opening_row_added else 0)
         sum_row     = last_row + 1
         charged_row = sum_row + 1
         refund_row  = sum_row + 2
