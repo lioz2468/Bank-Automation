@@ -1,0 +1,17 @@
+08:19:20  INFO      Parsing PDF: 463560.pdf
+08:19:20  INFO      Parsed 12 tier rows; total_tier1=27951.02 excess=217257.92 total_charged=245208.93
+08:19:20  INFO      Fetching BOI rate from API for 01/10/25 – 31/12/25 …
+08:19:22  INFO      BOI rate: 4.50% -> 4.25% (change on 27.11)
+08:19:22  INFO      Parsing transactions: transactions.xlsx
+08:19:55  INFO      Transactions loaded: 31 rows
+08:19:55  INFO      Account      : 463560
+08:19:55  INFO      Period       : 01/10/25 – 31/12/25
+08:19:55  INFO      Charge date  : 01/01/26
+08:19:55  INFO      Tier rows    : 12
+08:19:55  INFO      Tier 1 total : 27951.02
+08:19:55  INFO      Excess total : 217257.92
+08:19:55  INFO      Total charged: 245208.93
+08:19:55  INFO      Writing Excel: output_463560.xlsx
+DBG op='רבית (תאריך ערך: 01/' rib_in=True
+DBG op='רבית (תאריך ערך: 03/' rib_in=True
+08:19:55  INFO      Done. Output saved to: output_463560.xlsx
