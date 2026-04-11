@@ -2,6 +2,7 @@
 Data models for Bank Hapoalim interest charge statements.
 """
 from dataclasses import dataclass, field
+from datetime import date
 from typing import List, Optional
 
 
@@ -38,6 +39,7 @@ class BankTransaction:
     debit: Optional[float]    # Debit amount (positive = money leaving account)
     credit: Optional[float]   # Credit amount
     balance: Optional[float]  # Running balance
+    value_date: Optional[date] = None  # תאריך ערך extracted from operation text
 
 
 @dataclass

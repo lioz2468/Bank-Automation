@@ -24,6 +24,11 @@ import re
 from datetime import datetime as _datetime, date as _date
 from typing import Dict, List, Optional
 
+# Matches "תאריך ערך: DD/MM" or "תאריך ערך: DD/MM/YY(YY)"
+_VALUE_DATE_RE = re.compile(
+    r'תאריך ערך[:\s]+(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?'
+)
+
 import openpyxl
 
 from models.statement import BankTransaction
@@ -110,6 +115,43 @@ def _to_float(val) -> Optional[float]:
         return None
 
 
+def _extract_value_date(operation: str, tx_date_str: str) -> Optional[_date]:
+    """
+    Extract תאריך ערך from operation text.
+    tx_date_str must be in DD.MM.YYYY format (after _normalise_date).
+    Year is inferred from the transaction date: if value_date > tx_date, use year-1.
+    """
+    m = _VALUE_DATE_RE.search(operation)
+    if not m:
+        return None
+    day, month = int(m.group(1)), int(m.group(2))
+    if m.group(3):
+        yr_raw = m.group(3)
+        yr = int(yr_raw) + 2000 if len(yr_raw) == 2 else int(yr_raw)
+        try:
+            return _date(yr, month, day)
+        except ValueError:
+            return None
+
+    # Infer year from transaction date
+    try:
+        tx_dt = _datetime.strptime(tx_date_str, "%d.%m.%Y").date()
+    except ValueError:
+        return None
+    yr = tx_dt.year
+    try:
+        vd = _date(yr, month, day)
+    except ValueError:
+        return None
+    # value_date should be <= transaction date; if not, use prior year
+    if vd > tx_dt:
+        try:
+            vd = _date(yr - 1, month, day)
+        except ValueError:
+            return None
+    return vd
+
+
 def _normalise_date(raw: str) -> str:
     """
     Normalise a date string to DD.MM.YYYY.
@@ -141,6 +183,7 @@ def _row_to_tx(row: list, mapping: Dict[int, str]) -> Optional[BankTransaction]:
     fields: Dict[str, object] = {
         "date": "", "code": "", "operation": "", "details": "",
         "reference": "", "batch": "", "debit": None, "credit": None, "balance": None,
+        "value_date": None,
     }
     for col_idx, field in mapping.items():
         if col_idx < len(row):
@@ -155,6 +198,9 @@ def _row_to_tx(row: list, mapping: Dict[int, str]) -> Optional[BankTransaction]:
         return None   # skip header-repetition or totals rows
 
     fields["date"] = _normalise_date(date_str)
+    fields["value_date"] = _extract_value_date(
+        str(fields["operation"]), str(fields["date"])
+    )
     return BankTransaction(**fields)  # type: ignore[arg-type]
 
 

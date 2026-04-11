@@ -163,6 +163,66 @@ def _parse_rate_change_day(rate_change_date: str) -> Optional[date]:
     return None
 
 
+def _find_adjustments(
+    transactions: List[BankTransaction],
+    period_from_dt: Optional[date],
+    period_to_dt: Optional[date],
+) -> List[tuple]:
+    """
+    Return non-canceled value_date adjustments as list of
+    (value_date, tx_date, amount, description).
+
+    Cancellation: pairs sharing the same value_date whose amounts sum to ~0
+    (one debit, one credit with identical absolute value) are removed.
+    """
+    vd_list = []
+    for tx in transactions:
+        if tx.value_date is None:
+            continue
+        tx_dt_obj = _parse_tx_date(tx.date)
+        if tx_dt_obj is None:
+            continue
+        d = tx_dt_obj.date()
+        if period_from_dt and d < period_from_dt:
+            continue
+        if period_to_dt and d > period_to_dt:
+            continue
+        # positive = credit (money in), negative = debit (money out)
+        amount = (tx.credit or 0.0) - (tx.debit or 0.0)
+        clean_op = re.sub(r'\s*[\(\uff08]תאריך ערך[^\)\uff09]*[\)\uff09]', '', tx.operation).strip()
+        # Exclude interest transactions — only actual money movements create adjustments
+        if re.search(r'ריבית|רבית', clean_op):
+            continue
+        vd_str = tx.value_date.strftime('%d/%m')
+        desc = f"תיאום: {clean_op} ת.ערך {vd_str}"
+        vd_list.append({
+            'value_date': tx.value_date,
+            'tx_date': d,
+            'amount': amount,
+            'desc': desc,
+        })
+
+    # Greedy cancellation of (same value_date, opposite amounts summing to ~0)
+    used = [False] * len(vd_list)
+    for i in range(len(vd_list)):
+        if used[i]:
+            continue
+        for j in range(i + 1, len(vd_list)):
+            if used[j]:
+                continue
+            a, b = vd_list[i], vd_list[j]
+            if (a['value_date'] == b['value_date']
+                    and abs(a['amount'] + b['amount']) < 1.0):
+                used[i] = used[j] = True
+                break
+
+    return [
+        (v['value_date'], v['tx_date'], v['amount'], v['desc'])
+        for i, v in enumerate(vd_list)
+        if not used[i]
+    ]
+
+
 def _period_from_date(period_from: str) -> Optional[date]:
     """Parse "DD/MM/YY" or "DD/MM/YYYY" → date object."""
     for fmt in ("%d/%m/%y", "%d/%m/%Y"):
@@ -560,135 +620,267 @@ class ExcelWriter:
     # SHEET 3  חישוב החזר לפי יתרות בבנק
     # ═════════════════════════════════════════════════════════════════════
 
-    def _build_sheet3(self) -> None:
+    def _build_sheet3(self) -> None:  # noqa: C901
         ws = self.wb.create_sheet("חישוב החזר לפי יתרות בבנק")
         ws.sheet_view.rightToLeft = True
         stmt = self.stmt
 
-        # ── Row 3: Title + effective rates (hardcoded floats) ─────────────
-        # K3 = P1 effective rate, L3 = P2 effective rate (if rate changed mid-period)
-        # Formulas reference $K$3 or $L$3 directly — no intermediate helper cells.
         p1_eff = stmt.bank_rate_p1 + stmt.debit_margin
         p2_eff = (stmt.bank_rate_p2 + stmt.debit_margin
                   if stmt.bank_rate_p2 is not None else None)
 
-        _set(ws, "A3", "תנועות בחשבון", bold=True, alignment=_rtl_align())
-        _set(ws, "K3", p1_eff, number_format="0.00%", alignment=_center_rtl())
-        if p2_eff is not None:
-            _set(ws, "L3", p2_eff, number_format="0.00%", alignment=_center_rtl())
-
-        # ── Rate-change date for column switching ─────────────────────────
-        rcd = None
-        if stmt.rate_change_date is not None:
-            rcd = _parse_rate_change_day(stmt.rate_change_date)
-
-        # Filter transactions: one row per calendar date, within period, newest→oldest
-        period_to_dt = None
-        for _fmt in ("%d/%m/%y", "%d/%m/%Y", "%d.%m.%y", "%d.%m.%Y"):
+        # ── Parse period / charge dates ───────────────────────────────────
+        period_from_dt: Optional[date] = None
+        period_to_dt: Optional[date] = None
+        for _fmt in ("%d/%m/%y", "%d/%m/%Y"):
+            try:
+                period_from_dt = datetime.strptime(stmt.period_from, _fmt).date()
+                break
+            except ValueError:
+                pass
+        for _fmt in ("%d/%m/%y", "%d/%m/%Y"):
             try:
                 period_to_dt = datetime.strptime(stmt.period_to, _fmt).date()
                 break
             except ValueError:
                 pass
 
-        seen_dates: set = set()
-        filtered_tx = []
+        rcd: Optional[date] = None
+        if stmt.rate_change_date is not None:
+            rcd = _parse_rate_change_day(stmt.rate_change_date)
+
+        charge_dt = _parse_tx_date(stmt.charge_date)
+
+        # ── Filter transactions: up to period_to, keep all (no dedup) ────
+        all_tx: List[Tuple[BankTransaction, date, datetime]] = []
         for tx in stmt.transactions:
-            dt = _parse_tx_date(tx.date)
-            if dt is None:
+            dt_obj = _parse_tx_date(tx.date)
+            if dt_obj is None:
                 continue
-            d = dt.date()
+            d = dt_obj.date()
             if period_to_dt is not None and d > period_to_dt:
                 continue
-            if d in seen_dates:
-                continue
-            seen_dates.add(d)
-            filtered_tx.append(tx)
+            all_tx.append((tx, d, dt_obj))
+
+        # ── Find value-date adjustments (after cancellation) ─────────────
+        adjustments = _find_adjustments(stmt.transactions, period_from_dt, period_to_dt)
+        n_adj = len(adjustments)
+
+        # ── Column layout (1-based index) ─────────────────────────────────
+        # A=1 … I=9  fixed
+        # J=10 …     adjustment columns (n_adj of them)
+        # if n_adj > 0: adjusted-balance col after last adj col
+        # days col, P1 col, P2 col (if applicable), total col
+        ADJ_START = 10  # column J
+        if n_adj > 0:
+            ADJ_BAL_IDX = ADJ_START + n_adj          # adjusted balance
+            DAYS_IDX    = ADJ_START + n_adj + 1
+        else:
+            ADJ_BAL_IDX = None
+            DAYS_IDX    = ADJ_START                  # J = days when no adjustments
+
+        P1_IDX    = DAYS_IDX + 1
+        P2_IDX    = DAYS_IDX + 2 if p2_eff is not None else None
+        TOTAL_IDX = DAYS_IDX + 3 if p2_eff is not None else DAYS_IDX + 2
+        LABEL_IDX = TOTAL_IDX + 1
+
+        DAYS_LET  = get_column_letter(DAYS_IDX)
+        BAL_LET   = get_column_letter(ADJ_BAL_IDX) if ADJ_BAL_IDX else "I"
+        P1_LET    = get_column_letter(P1_IDX)
+        P2_LET    = get_column_letter(P2_IDX) if P2_IDX else None
+        TOTAL_LET = get_column_letter(TOTAL_IDX)
+        LABEL_LET = get_column_letter(LABEL_IDX)
+
+        # ── Row 1: account/period header ──────────────────────────────────
+        account_header = (
+            f"מספר חשבון 12-600-{stmt.account_number} "
+            f"לתקופה: {stmt.period_from} - {stmt.period_to}"
+        )
+        _set(ws, "A1", account_header, bold=True, alignment=_rtl_align())
+
+        # ── Row 2: effective rates ────────────────────────────────────────
+        _set(ws, "A2", "ריבית אפקטיבית P1:", bold=True, alignment=_rtl_align())
+        _set(ws, "B2", p1_eff, number_format="0.00%", alignment=_center_rtl())
+        if p2_eff is not None:
+            _set(ws, "C2", "P2:", bold=True, alignment=_rtl_align())
+            _set(ws, "D2", p2_eff, number_format="0.00%", alignment=_center_rtl())
+
+        # ── Row 3: column headers ─────────────────────────────────────────
+        HDR_ROW = 3
+        base_headers = {
+            "A": "תאריך", "B": "קוד פעולה", "C": "הפעולה",
+            "D": "פרטים", "E": "אסמכתא", "F": "צרור",
+            "G": "חובה", "H": "זכות", "I": 'יתרה בש"ח',
+        }
+        for col_l, label in base_headers.items():
+            _set(ws, f"{col_l}{HDR_ROW}", label, bold=True,
+                 fill_hex=_HEADER_FILL2, alignment=_center_rtl(), border=_thin_border())
+
+        for j, (_, _, _, adj_desc) in enumerate(adjustments):
+            col_l = get_column_letter(ADJ_START + j)
+            _set(ws, f"{col_l}{HDR_ROW}", adj_desc, bold=True,
+                 fill_hex=_HEADER_FILL2, alignment=_center_rtl(), border=_thin_border())
+
+        if ADJ_BAL_IDX:
+            _set(ws, f"{BAL_LET}{HDR_ROW}", "יתרה מתואמת", bold=True,
+                 fill_hex=_HEADER_FILL2, alignment=_center_rtl(), border=_thin_border())
+
+        _set(ws, f"{DAYS_LET}{HDR_ROW}", "ימים", bold=True,
+             fill_hex=_HEADER_FILL2, alignment=_center_rtl(), border=_thin_border())
+        _set(ws, f"{P1_LET}{HDR_ROW}", "ריבית P1", bold=True,
+             fill_hex=_HEADER_FILL2, alignment=_center_rtl(), border=_thin_border())
+        if P2_LET:
+            _set(ws, f"{P2_LET}{HDR_ROW}", "ריבית P2", bold=True,
+                 fill_hex=_HEADER_FILL2, alignment=_center_rtl(), border=_thin_border())
+            _set(ws, f"{TOTAL_LET}{HDR_ROW}", 'סה"כ', bold=True,
+                 fill_hex=_HEADER_FILL2, alignment=_center_rtl(), border=_thin_border())
 
         DATA_START = 4
         num_fmt_money = "#,##0.00"
 
-        # J for first row: days from first tx date to charge date (hardcoded int)
-        charge_dt = _parse_tx_date(stmt.charge_date)
-        first_dt  = _parse_tx_date(filtered_tx[0].date) if filtered_tx else None
-        first_j   = 1 if (charge_dt is None or first_dt is None) else max(1, (charge_dt - first_dt).days)
+        # ── Pre-compute days per unique date (process in input order) ─────
+        # Input is typically newest-first; first unique date seen = newest.
+        # days[newest] = charge_date - newest
+        # days[d_i]    = d_{i-1} - d_i  (previous unique seen, which is newer)
+        unique_dates_ordered: List[date] = []
+        seen_dates_set: set = set()
+        for _, d, _ in all_tx:
+            if d not in seen_dates_set:
+                seen_dates_set.add(d)
+                unique_dates_ordered.append(d)
 
-        for i, tx in enumerate(filtered_tx):
-            n  = DATA_START + i
-            dt = _parse_tx_date(tx.date)
-
-            _set(ws, f"A{n}", dt if dt is not None else tx.date,
-                 number_format="DD.MM.YYYY", alignment=_center_rtl())
-            _set(ws, f"B{n}", tx.code,      alignment=_center_rtl())
-            _set(ws, f"C{n}", tx.operation, alignment=_rtl_align())
-            _set(ws, f"D{n}", tx.details,   alignment=_rtl_align())
-            _set(ws, f"E{n}", tx.reference, alignment=_center_rtl())
-            _set(ws, f"F{n}", tx.batch,     alignment=_center_rtl())
-            if tx.debit   is not None:
-                _set(ws, f"G{n}", tx.debit,   number_format=num_fmt_money, alignment=_right_rtl())
-            if tx.credit  is not None:
-                _set(ws, f"H{n}", tx.credit,  number_format=num_fmt_money, alignment=_right_rtl())
-            if tx.balance is not None:
-                _set(ws, f"I{n}", tx.balance, number_format=num_fmt_money, alignment=_right_rtl())
-
-            # J: days held. First row = hardcoded int; subsequent = formula.
-            ws[f"J{n}"].value         = first_j if i == 0 else f"=A{n-1}-A{n}"
-            ws[f"J{n}"].number_format = "0"
-            ws[f"J{n}"].alignment     = _center_rtl()
-
-            # Interest formula: K column for P1, L column for P2.
-            # Rows with date >= rate_change_date use L (P2 rate $L$3).
-            # All other rows (or when no P2) use K (P1 rate $K$3).
-            tx_date = dt.date() if dt is not None else None
-            use_p2  = (p2_eff is not None and rcd is not None
-                       and tx_date is not None and tx_date >= rcd)
-
-            if use_p2:
-                ws[f"L{n}"].value         = f"=I{n}/365*J{n}*$L$3"
-                ws[f"L{n}"].number_format = num_fmt_money
-                ws[f"L{n}"].alignment     = _right_rtl()
+        date_to_days: dict = {}
+        for i, d in enumerate(unique_dates_ordered):
+            if i == 0:
+                date_to_days[d] = (
+                    max(1, (charge_dt.date() - d).days)
+                    if charge_dt is not None else 1
+                )
             else:
-                ws[f"K{n}"].value         = f"=I{n}/365*J{n}*$K$3"
-                ws[f"K{n}"].number_format = num_fmt_money
-                ws[f"K{n}"].alignment     = _right_rtl()
+                date_to_days[d] = max(0, (unique_dates_ordered[i - 1] - d).days)
 
-        # ── Summary rows ───────────────────────────────────────────────────
-        last_row    = DATA_START + len(filtered_tx) - 1 if filtered_tx else DATA_START - 1
-        sum_row     = last_row + 1
+        # ── Write transaction rows ────────────────────────────────────────
+        # For days: assign to the FIRST ROW WITH BALANCE for each date.
+        # Rows without balance (common for intermediate intra-day transactions)
+        # get days=0 and the date is not yet "consumed", so the next row with
+        # a balance can claim it.  This ensures the interest formula always
+        # has a valid balance to work with.
+        dates_days_written: set = set()
+
+        for i, (tx, d, dt_obj) in enumerate(all_tx):
+            row = DATA_START + i
+
+            has_balance = tx.balance is not None
+            if d not in dates_days_written and has_balance:
+                days_val = date_to_days.get(d, 0)
+                dates_days_written.add(d)
+            else:
+                days_val = 0
+
+            # Base columns A–I
+            _set(ws, f"A{row}", dt_obj,
+                 number_format="DD.MM.YYYY", alignment=_center_rtl())
+            _set(ws, f"B{row}", tx.code,      alignment=_center_rtl())
+            _set(ws, f"C{row}", tx.operation, alignment=_rtl_align())
+            _set(ws, f"D{row}", tx.details,   alignment=_rtl_align())
+            _set(ws, f"E{row}", tx.reference, alignment=_center_rtl())
+            _set(ws, f"F{row}", tx.batch,     alignment=_center_rtl())
+            if tx.debit is not None:
+                _set(ws, f"G{row}", tx.debit,
+                     number_format=num_fmt_money, alignment=_right_rtl())
+            if tx.credit is not None:
+                _set(ws, f"H{row}", tx.credit,
+                     number_format=num_fmt_money, alignment=_right_rtl())
+            if tx.balance is not None:
+                _set(ws, f"I{row}", tx.balance,
+                     number_format=num_fmt_money, alignment=_right_rtl())
+
+            # Adjustment columns: value only when adj_vd <= row_date < adj_tx_date
+            for j, (adj_vd, adj_tx_date, adj_amount, _) in enumerate(adjustments):
+                if adj_vd <= d < adj_tx_date:
+                    col_l = get_column_letter(ADJ_START + j)
+                    _set(ws, f"{col_l}{row}", adj_amount,
+                         number_format=num_fmt_money, alignment=_right_rtl())
+
+            # Adjusted balance formula (sum of I + all adj columns)
+            if ADJ_BAL_IDX:
+                adj_first = get_column_letter(ADJ_START)
+                adj_last  = get_column_letter(ADJ_START + n_adj - 1)
+                ws[f"{BAL_LET}{row}"].value        = f"=I{row}+SUM({adj_first}{row}:{adj_last}{row})"
+                ws[f"{BAL_LET}{row}"].number_format = num_fmt_money
+                ws[f"{BAL_LET}{row}"].alignment    = _right_rtl()
+
+            # Days column (hardcoded integer)
+            ws[f"{DAYS_LET}{row}"].value        = days_val
+            ws[f"{DAYS_LET}{row}"].number_format = "0"
+            ws[f"{DAYS_LET}{row}"].alignment    = _center_rtl()
+
+            # Interest formula: only when days > 0 and balance present
+            if days_val > 0 and tx.balance is not None:
+                use_p2 = (p2_eff is not None and rcd is not None and d >= rcd)
+                rate   = p2_eff if use_p2 else p1_eff
+                int_col = P2_LET if use_p2 else P1_LET
+                ws[f"{int_col}{row}"].value = (
+                    f'=IF({BAL_LET}{row}<0,'
+                    f'{BAL_LET}{row}/365*{days_val}*{rate},"")'
+                )
+                ws[f"{int_col}{row}"].number_format = num_fmt_money
+                ws[f"{int_col}{row}"].alignment    = _right_rtl()
+
+        # ── Summary rows ──────────────────────────────────────────────────
+        last_data_row = DATA_START + len(all_tx) - 1 if all_tx else DATA_START - 1
+        sum_row     = last_data_row + 1
         charged_row = sum_row + 1
         refund_row  = sum_row + 2
 
-        if filtered_tx:
-            ws[f"K{sum_row}"].value = f"=SUM(K{DATA_START}:K{last_row})"
-            ws[f"L{sum_row}"].value = f"=SUM(L{DATA_START}:L{last_row})"
-            ws[f"M{sum_row}"].value = f"=SUM(K{sum_row}:L{sum_row})"
+        # Sum of P1 and P2 interest columns
+        if all_tx:
+            ws[f"{P1_LET}{sum_row}"].value        = f"=SUM({P1_LET}{DATA_START}:{P1_LET}{last_data_row})"
+            ws[f"{P1_LET}{sum_row}"].number_format = num_fmt_money
+            if P2_LET:
+                ws[f"{P2_LET}{sum_row}"].value        = f"=SUM({P2_LET}{DATA_START}:{P2_LET}{last_data_row})"
+                ws[f"{P2_LET}{sum_row}"].number_format = num_fmt_money
+                ws[f"{TOTAL_LET}{sum_row}"].value = f"=SUM({P1_LET}{sum_row}:{P2_LET}{sum_row})"
+            else:
+                ws[f"{TOTAL_LET}{sum_row}"].value = f"={P1_LET}{sum_row}"
         else:
-            ws[f"M{sum_row}"].value = 0
-        ws[f"K{sum_row}"].number_format = num_fmt_money
-        ws[f"L{sum_row}"].number_format = num_fmt_money
-        ws[f"M{sum_row}"].number_format = num_fmt_money
-        _set(ws, f"N{sum_row}", "סכום לתשלום", bold=True, alignment=_rtl_align())
+            ws[f"{TOTAL_LET}{sum_row}"].value = 0
+
+        ws[f"{TOTAL_LET}{sum_row}"].number_format = num_fmt_money
+        ws[f"{TOTAL_LET}{sum_row}"].font          = _font(bold=True)
+        ws[f"{TOTAL_LET}{sum_row}"].fill          = _fill(_YELLOW)
+        ws[f"{TOTAL_LET}{sum_row}"].alignment     = _right_rtl()
+        _set(ws, f"{LABEL_LET}{sum_row}", "סכום לחיוב", bold=True, alignment=_rtl_align())
 
         sheet1_name = self.wb.worksheets[0].title
-        ws[f"M{charged_row}"].value        = f"=-'{sheet1_name}'!G{self._sheet1_total_row}"
-        ws[f"M{charged_row}"].number_format = num_fmt_money
-        ws[f"M{charged_row}"].alignment    = _right_rtl()
-        _set(ws, f"N{charged_row}", "סכום שירד בפועל", alignment=_rtl_align())
+        ws[f"{TOTAL_LET}{charged_row}"].value        = f"=-'{sheet1_name}'!G{self._sheet1_total_row}"
+        ws[f"{TOTAL_LET}{charged_row}"].number_format = num_fmt_money
+        ws[f"{TOTAL_LET}{charged_row}"].alignment    = _right_rtl()
+        _set(ws, f"{LABEL_LET}{charged_row}", "סכום שירד בפועל", alignment=_rtl_align())
 
-        ws[f"M{refund_row}"].value        = f"=M{sum_row}-M{charged_row}"
-        ws[f"M{refund_row}"].number_format = num_fmt_money
-        ws[f"M{refund_row}"].font          = _font(bold=True)
-        ws[f"M{refund_row}"].fill          = _fill(_YELLOW)
-        ws[f"M{refund_row}"].alignment     = _right_rtl()
-        _set(ws, f"N{refund_row}", "החזר ", bold=True,
+        ws[f"{TOTAL_LET}{refund_row}"].value        = f"={TOTAL_LET}{sum_row}-{TOTAL_LET}{charged_row}"
+        ws[f"{TOTAL_LET}{refund_row}"].number_format = num_fmt_money
+        ws[f"{TOTAL_LET}{refund_row}"].font          = _font(bold=True)
+        ws[f"{TOTAL_LET}{refund_row}"].fill          = _fill(_YELLOW)
+        ws[f"{TOTAL_LET}{refund_row}"].alignment     = _right_rtl()
+        _set(ws, f"{LABEL_LET}{refund_row}", "החזר ", bold=True,
              fill_hex=_YELLOW, alignment=_rtl_align())
 
         # ── Column widths ─────────────────────────────────────────────────
-        col_widths = {
-            "A": 14, "B": 12, "C": 22, "D": 18, "E": 14,
-            "F": 8,  "G": 18, "H": 18, "I": 18, "J": 12,
-            "K": 12, "L": 12, "M": 16, "N": 18,
+        col_widths: dict = {
+            "A": 14, "B": 12, "C": 28, "D": 18, "E": 14,
+            "F": 8,  "G": 18, "H": 18, "I": 18,
         }
+        for j in range(n_adj):
+            col_widths[get_column_letter(ADJ_START + j)] = 22
+        if ADJ_BAL_IDX:
+            col_widths[BAL_LET] = 20
+        col_widths[DAYS_LET]  = 8
+        col_widths[P1_LET]    = 14
+        if P2_LET:
+            col_widths[P2_LET]    = 14
+        col_widths[TOTAL_LET] = 16
+        col_widths[LABEL_LET] = 20
         for col, width in col_widths.items():
             ws.column_dimensions[col].width = width
 
