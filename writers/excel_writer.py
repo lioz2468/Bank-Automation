@@ -505,7 +505,7 @@ class ExcelWriter:
         row += 1
         total_row = row
         self._sheet1_total_row = total_row
-        ws[f"G{total_row}"].value        = f"=SUM(G{sum_row}:G{excess_row})"
+        ws[f"G{total_row}"].value        = f"=G{sum_row}+G{excess_row}"
         ws[f"G{total_row}"].number_format = '#,##0.00'
         ws[f"G{total_row}"].font          = _font(bold=True)
         ws[f"G{total_row}"].alignment     = _right_rtl()
