@@ -25,7 +25,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
 
 import requests
@@ -89,8 +89,11 @@ def fetch_boi_rates(
             f"Cannot parse billing period dates: {period_from!r} / {period_to!r}"
         )
 
-    start_str = from_date.strftime("%Y-%m-%d")
-    end_str   = to_date.strftime("%Y-%m-%d")
+    # Extend lookback 120 days to capture the previous quarter's starting rate.
+    # The bank uses that earlier rate as P1 when there was a pre-period rate change.
+    fetch_from = from_date - timedelta(days=120)
+    start_str  = fetch_from.strftime("%Y-%m-%d")
+    end_str    = to_date.strftime("%Y-%m-%d")
 
     logger.info("Fetching BOI rate from API for %s – %s …", period_from, period_to)
 
@@ -153,16 +156,56 @@ def fetch_boi_rates(
 
     rows.sort(key=lambda x: x[0])
 
-    # ── Detect rate change within the period ─────────────────────────────
-    rate1       = rows[0][1]
+    # ── Identify rate at period start and rate before the period ─────────
+    # r_prev: last known rate strictly before from_date (previous quarter)
+    # r_start: last known rate on or before from_date (current period start)
+    r_prev:  Optional[float] = None
+    r_start: Optional[float] = None
+    for dt, val in rows:
+        if dt < from_date:
+            r_prev = val
+        elif r_start is None:
+            r_start = val
+
+    # If there are no rows on/after from_date, use r_prev as r_start
+    if r_start is None:
+        r_start = r_prev
+    # If there are no rows before from_date, r_prev == r_start (no pre-period change)
+    if r_prev is None:
+        r_prev = r_start
+
+    rate1:       float         = r_start   # type: ignore[assignment]
     rate2:       Optional[float] = None
     change_date: Optional[str]   = None
 
-    for dt, val in rows:
-        if abs(val - rate1) > 1e-9:
-            rate2       = val
-            change_date = dt.strftime("%d.%m")
-            break
+    if r_prev is not None and r_start is not None and abs(r_prev - r_start) > 1e-9:
+        # Pre-period rate change detected.
+        # Bank convention: P1 = previous-quarter starting rate (r_prev),
+        #                  P2 = current-period starting rate (r_start),
+        #                  change_date = first within-period API rate change date.
+        rate1 = r_prev
+        # Find the split date: first within-period API rate change
+        prev_val = r_start
+        for dt, val in rows:
+            if dt < from_date:
+                continue
+            if abs(val - prev_val) > 1e-9:
+                rate2       = r_start   # P2 = period-start rate, not the new API value
+                change_date = dt.strftime("%d.%m")
+                break
+            prev_val = val
+        if rate2 is None:
+            # No within-period API change: single rate for whole period
+            rate1 = r_start
+    else:
+        # No pre-period change: scan within-period for a rate change (original logic)
+        for dt, val in rows:
+            if dt < from_date:
+                continue
+            if abs(val - rate1) > 1e-9:
+                rate2       = val
+                change_date = dt.strftime("%d.%m")
+                break
 
     if rate2 is not None:
         logger.info(
