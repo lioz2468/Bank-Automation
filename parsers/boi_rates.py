@@ -40,8 +40,10 @@ _SERIES_CODE = "MNT_RIB_BOI_D"
 _TIMEOUT     = 20   # seconds
 
 
-def _parse_period_date(date_str: str) -> Optional[date]:
-    """Parse "DD/MM/YY" or "DD/MM/YYYY" → date object."""
+def _parse_period_date(date_str) -> Optional[date]:
+    """Parse "DD/MM/YY" or "DD/MM/YYYY" → date object. Also accepts a date/datetime directly."""
+    if isinstance(date_str, date):
+        return date_str if not isinstance(date_str, datetime) else date_str.date()
     for fmt in ("%d/%m/%y", "%d/%m/%Y"):
         try:
             return datetime.strptime(date_str.strip(), fmt).date()
@@ -51,8 +53,8 @@ def _parse_period_date(date_str: str) -> Optional[date]:
 
 
 def fetch_boi_rates(
-    period_from: str,
-    period_to: str,
+    period_from,
+    period_to,
 ) -> Tuple[float, Optional[float], Optional[str]]:
     """
     Fetch BOI base interest rate(s) for the given billing period.
