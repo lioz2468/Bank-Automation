@@ -15,7 +15,7 @@ written in Excel A1 notation exactly as they appear in the sample file.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
 import openpyxl
@@ -146,18 +146,17 @@ def _parse_tx_date(date_str: str) -> Optional[datetime]:
 
 # ── Rate-change date helper ───────────────────────────────────────────────────
 
-def _parse_rate_change_day(rate_change_date: str) -> Optional[date]:
+def _parse_rate_change_day(rate_change_date: str, year: int = 2025) -> Optional[date]:
     """
-    Convert a rate-change string like "27.11" to a date.
-    Assumes the year is taken from context (the billing quarter).
+    Convert a rate-change string like "27.11" or "08.01" to a date.
+    The year must be supplied from the billing period (defaults to 2025).
     Returns None if parsing fails.
     """
     try:
         parts = rate_change_date.strip().split(".")
         if len(parts) == 2:
             day, month = int(parts[0]), int(parts[1])
-            # Use a plausible year
-            return date(2025, month, day)
+            return date(year, month, day)
     except Exception:
         pass
     return None
@@ -647,7 +646,8 @@ class ExcelWriter:
 
         rcd: Optional[date] = None
         if stmt.rate_change_date is not None:
-            rcd = _parse_rate_change_day(stmt.rate_change_date)
+            rcd_year = period_from_dt.year if period_from_dt is not None else 2025
+            rcd = _parse_rate_change_day(stmt.rate_change_date, rcd_year)
 
         charge_dt = _parse_tx_date(stmt.charge_date)
 
@@ -738,71 +738,122 @@ class ExcelWriter:
         DATA_START = 4
         num_fmt_money = "#,##0.00"
 
-        # ── Pre-compute days per unique date (process in input order) ─────
-        # Input is typically newest-first; first unique date seen = newest.
-        # days[newest] = charge_date - newest
-        # days[d_i]    = d_{i-1} - d_i  (previous unique seen, which is newer)
+        # ── Build carry-forward balance lookup ────────────────────────────
+        # For synthetic rows we need the last known balance on or before that day.
+        all_tx_asc = sorted(all_tx, key=lambda x: x[1])
+        _cf_entries: List[List] = []   # [[date, balance], …] ascending
+        _last_cf: Optional[float] = None
+        for _tx, _d, _ in all_tx_asc:
+            if _tx.balance is not None:
+                _last_cf = _tx.balance
+            if _cf_entries and _cf_entries[-1][0] == _d:
+                _cf_entries[-1][1] = _last_cf
+            else:
+                _cf_entries.append([_d, _last_cf])
+
+        def _carry_forward(day: date) -> float:
+            result = 0.0
+            for _cd, _cb in _cf_entries:
+                if _cd <= day:
+                    result = _cb if _cb is not None else 0.0
+                else:
+                    break
+            return result
+
+        # ── Find synthetic gap rows ───────────────────────────────────────
+        # For each adjustment, every calendar day between value_date and
+        # transaction_date that has no real transaction needs a synthetic row
+        # so interest is calculated on each of those days individually.
+        real_tx_dates: set = set(d for _, d, _ in all_tx)
+        synthetic_days: set = set()
+        for adj_vd, adj_tx_date, adj_amount, _ in adjustments:
+            cur = adj_vd
+            while cur < adj_tx_date:
+                if cur not in real_tx_dates:
+                    synthetic_days.add(cur)
+                cur += timedelta(days=1)
+
+        # ── Build combined row list (real + synthetic) ────────────────────
+        # Each entry: ('real', d, dt_obj, tx) | ('synthetic', d, dt_obj, base_balance)
+        combined: List[tuple] = []
+        for tx, d, dt_obj in all_tx:
+            combined.append(('real', d, dt_obj, tx))
+        for _d in synthetic_days:
+            _dt_obj = datetime(_d.year, _d.month, _d.day)
+            combined.append(('synthetic', _d, _dt_obj, _carry_forward(_d)))
+
+        # Sort newest-first; within same date, real rows precede synthetic
+        combined.sort(key=lambda x: (-x[1].toordinal(), 0 if x[0] == 'real' else 1))
+
+        # ── Compute days per unique date ──────────────────────────────────
+        # days = (previous_newer_unique_date − this_date); newest gets charge_dt gap.
         unique_dates_ordered: List[date] = []
-        seen_dates_set: set = set()
-        for _, d, _ in all_tx:
-            if d not in seen_dates_set:
-                seen_dates_set.add(d)
-                unique_dates_ordered.append(d)
+        _seen_u: set = set()
+        for _, _d, _, _ in combined:
+            if _d not in _seen_u:
+                _seen_u.add(_d)
+                unique_dates_ordered.append(_d)
 
         date_to_days: dict = {}
-        for i, d in enumerate(unique_dates_ordered):
+        for i, _d in enumerate(unique_dates_ordered):
             if i == 0:
-                date_to_days[d] = (
-                    max(1, (charge_dt.date() - d).days)
+                date_to_days[_d] = (
+                    max(1, (charge_dt.date() - _d).days)
                     if charge_dt is not None else 1
                 )
             else:
-                date_to_days[d] = max(0, (unique_dates_ordered[i - 1] - d).days)
+                date_to_days[_d] = max(0, (unique_dates_ordered[i - 1] - _d).days)
 
-        # ── Write transaction rows ────────────────────────────────────────
-        # For days: assign to the FIRST ROW WITH BALANCE for each date.
-        # Rows without balance (common for intermediate intra-day transactions)
-        # get days=0 and the date is not yet "consumed", so the next row with
-        # a balance can claim it.  This ensures the interest formula always
-        # has a valid balance to work with.
+        # ── Write all rows ────────────────────────────────────────────────
+        # Days assigned to first row-with-balance per date (real or synthetic).
         dates_days_written: set = set()
 
-        for i, (tx, d, dt_obj) in enumerate(all_tx):
+        for i, (row_type, d, dt_obj, row_data) in enumerate(combined):
             row = DATA_START + i
 
-            has_balance = tx.balance is not None
+            is_synthetic = (row_type == 'synthetic')
+            has_balance = (not is_synthetic and row_data.balance is not None) or is_synthetic
+
             if d not in dates_days_written and has_balance:
                 days_val = date_to_days.get(d, 0)
                 dates_days_written.add(d)
             else:
                 days_val = 0
 
-            # Base columns A–I
+            # Column A: date
             _set(ws, f"A{row}", dt_obj,
                  number_format="DD.MM.YYYY", alignment=_center_rtl())
-            _set(ws, f"B{row}", tx.code,      alignment=_center_rtl())
-            _set(ws, f"C{row}", tx.operation, alignment=_rtl_align())
-            _set(ws, f"D{row}", tx.details,   alignment=_rtl_align())
-            _set(ws, f"E{row}", tx.reference, alignment=_center_rtl())
-            _set(ws, f"F{row}", tx.batch,     alignment=_center_rtl())
-            if tx.debit is not None:
-                _set(ws, f"G{row}", tx.debit,
-                     number_format=num_fmt_money, alignment=_right_rtl())
-            if tx.credit is not None:
-                _set(ws, f"H{row}", tx.credit,
-                     number_format=num_fmt_money, alignment=_right_rtl())
-            if tx.balance is not None:
-                _set(ws, f"I{row}", tx.balance,
-                     number_format=num_fmt_money, alignment=_right_rtl())
 
-            # Adjustment columns: value only when adj_vd <= row_date < adj_tx_date
+            if is_synthetic:
+                # Synthetic rows: only base balance in column I; other tx fields empty
+                base_bal = row_data   # float (carry-forward balance)
+                _set(ws, f"I{row}", base_bal,
+                     number_format=num_fmt_money, alignment=_right_rtl())
+            else:
+                tx = row_data
+                _set(ws, f"B{row}", tx.code,      alignment=_center_rtl())
+                _set(ws, f"C{row}", tx.operation, alignment=_rtl_align())
+                _set(ws, f"D{row}", tx.details,   alignment=_rtl_align())
+                _set(ws, f"E{row}", tx.reference, alignment=_center_rtl())
+                _set(ws, f"F{row}", tx.batch,     alignment=_center_rtl())
+                if tx.debit is not None:
+                    _set(ws, f"G{row}", tx.debit,
+                         number_format=num_fmt_money, alignment=_right_rtl())
+                if tx.credit is not None:
+                    _set(ws, f"H{row}", tx.credit,
+                         number_format=num_fmt_money, alignment=_right_rtl())
+                if tx.balance is not None:
+                    _set(ws, f"I{row}", tx.balance,
+                         number_format=num_fmt_money, alignment=_right_rtl())
+
+            # Adjustment columns: value when adj_vd <= d < adj_tx_date
             for j, (adj_vd, adj_tx_date, adj_amount, _) in enumerate(adjustments):
                 if adj_vd <= d < adj_tx_date:
                     col_l = get_column_letter(ADJ_START + j)
                     _set(ws, f"{col_l}{row}", adj_amount,
                          number_format=num_fmt_money, alignment=_right_rtl())
 
-            # Adjusted balance formula (sum of I + all adj columns)
+            # Adjusted balance formula (I + all adj columns)
             if ADJ_BAL_IDX:
                 adj_first = get_column_letter(ADJ_START)
                 adj_last  = get_column_letter(ADJ_START + n_adj - 1)
@@ -810,13 +861,13 @@ class ExcelWriter:
                 ws[f"{BAL_LET}{row}"].number_format = num_fmt_money
                 ws[f"{BAL_LET}{row}"].alignment    = _right_rtl()
 
-            # Days column (hardcoded integer)
+            # Days column
             ws[f"{DAYS_LET}{row}"].value        = days_val
             ws[f"{DAYS_LET}{row}"].number_format = "0"
             ws[f"{DAYS_LET}{row}"].alignment    = _center_rtl()
 
-            # Interest formula: only when days > 0 and balance present
-            if days_val > 0 and tx.balance is not None:
+            # Interest formula: only when days > 0 and has balance
+            if days_val > 0 and has_balance:
                 use_p2 = (p2_eff is not None and rcd is not None and d >= rcd)
                 rate   = p2_eff if use_p2 else p1_eff
                 int_col = P2_LET if use_p2 else P1_LET
@@ -828,7 +879,7 @@ class ExcelWriter:
                 ws[f"{int_col}{row}"].alignment    = _right_rtl()
 
         # ── Summary rows ──────────────────────────────────────────────────
-        last_data_row = DATA_START + len(all_tx) - 1 if all_tx else DATA_START - 1
+        last_data_row = DATA_START + len(combined) - 1 if combined else DATA_START - 1
         sum_row     = last_data_row + 1
         charged_row = sum_row + 1
         refund_row  = sum_row + 2
