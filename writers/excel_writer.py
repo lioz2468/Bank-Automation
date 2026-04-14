@@ -234,20 +234,19 @@ def _period_from_date(period_from: str) -> Optional[date]:
 
 def _period_needs_p2(period_from: str, rate_change_date: str) -> bool:
     """
-    Return True if the period is on or after the rate-change date
-    (meaning the P2 formula column is relevant).
+    Return True if the period starts on or after the rate-change date
+    (meaning it should use the P2 / K-column refund formula).
 
-    Based on the sample: periods starting 26/11/25 or later include J-column
-    formulas.  The rate-change date is 27.11 but the boundary row (26/11) is
-    included.
+    The year is inferred from the period_from date so that "08.01" resolves
+    to the correct year (e.g. 2026-01-08 for a Q1 2026 billing period).
     """
-    rcd = _parse_rate_change_day(rate_change_date)
     pfd = _period_from_date(period_from)
-    if rcd is None or pfd is None:
+    if pfd is None:
         return False
-    # Include the day before rate change (boundary row)
-    from datetime import timedelta
-    return pfd >= (rcd - timedelta(days=1))
+    rcd = _parse_rate_change_day(rate_change_date, pfd.year)
+    if rcd is None:
+        return False
+    return pfd >= rcd
 
 
 # ── ExcelWriter ───────────────────────────────────────────────────────────────
