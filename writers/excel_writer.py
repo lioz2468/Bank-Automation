@@ -189,9 +189,6 @@ def _find_adjustments(
         # positive = credit (money in), negative = debit (money out)
         amount = (tx.credit or 0.0) - (tx.debit or 0.0)
         clean_op = re.sub(r'\s*[\(\uff08]תאריך ערך[^\)\uff09]*[\)\uff09]', '', tx.operation).strip()
-        # Exclude interest transactions — only actual money movements create adjustments
-        if re.search(r'ריבית|רבית', clean_op):
-            continue
         vd_str = tx.value_date.strftime('%d/%m')
         desc = f"תיאום: {clean_op} ת.ערך {vd_str}"
         vd_list.append({
