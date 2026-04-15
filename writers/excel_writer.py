@@ -738,23 +738,21 @@ class ExcelWriter:
         num_fmt_money = "#,##0.00"
 
         # ── Build carry-forward balance lookup ────────────────────────────
-        # For synthetic rows we need the last known balance on or before that day.
-        all_tx_asc = sorted(all_tx, key=lambda x: x[1])
-        _cf_entries: List[List] = []   # [[date, balance], …] ascending
-        _last_cf: Optional[float] = None
-        for _tx, _d, _ in all_tx_asc:
-            if _tx.balance is not None:
-                _last_cf = _tx.balance
-            if _cf_entries and _cf_entries[-1][0] == _d:
-                _cf_entries[-1][1] = _last_cf
-            else:
-                _cf_entries.append([_d, _last_cf])
+        # Synthetic rows need the closing balance of their value_date, which
+        # is the balance from the FIRST transaction row for that date in file
+        # order (file is newest-first, so first-in-file = last-chronological
+        # = the closing/end-of-day balance).
+        _cf_first: dict = {}   # date → first balance seen in original file order
+        for _tx, _d, _ in all_tx:   # original file order (newest-first)
+            if _tx.balance is not None and _d not in _cf_first:
+                _cf_first[_d] = _tx.balance
+        _cf_sorted = sorted(_cf_first.items())   # [(date, balance), …] ascending
 
         def _carry_forward(day: date) -> float:
             result = 0.0
-            for _cd, _cb in _cf_entries:
+            for _cd, _cb in _cf_sorted:
                 if _cd <= day:
-                    result = _cb if _cb is not None else 0.0
+                    result = _cb
                 else:
                     break
             return result
